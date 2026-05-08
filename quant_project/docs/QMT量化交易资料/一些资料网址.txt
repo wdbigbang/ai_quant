@@ -1,0 +1,3 @@
+QMT新手上手教程必读：https://dict.thinktrader.net/freshman/rookie.html
+QMT新手上手API代码教程必读：https://dict.thinktrader.net/freshman/rookie.html
+QMT新手上手mini QMT代码教程必读https://dict.thinktrader.net/nativeApi/start_now.html

@@ -1,0 +1,107 @@
+# 克隆自聚宽文章：https://www.joinquant.com/post/52358
+# 标题：ETF策略之全球核心资产动量轮动策略(动量+ATR)
+# 作者：howiecheng
+
+# 克隆自聚宽文章：https://www.joinquant.com/post/47888
+# 标题：ETF策略之核心资产轮动（线性增加权重）
+# 作者：MarioC
+
+import numpy as np
+import pandas as pd
+import math
+
+def initialize(context):
+    set_benchmark('000300.XSHG')
+    set_option('use_real_price', True)
+    set_option("avoid_future_data", True)
+    set_slippage(FixedSlippage(0.000))
+    set_order_cost(OrderCost(open_tax=0, close_tax=0, open_commission=0.0002, 
+                close_commission=0.0002, close_today_commission=0, min_commission=5), type='fund')
+    log.set_level('system', 'error')
+    
+    # 修改后的ETF池（替换纳指为标普500）
+    g.etf_pool = [
+        '518880.XSHG', #黄金ETF
+        '513500.XSHG', #标普500ETF（原纳指替换）
+        '159915.XSHE', #创业板
+        '510180.XSHG', #上证180
+        '510300.XSHG'  #新增沪深300
+    ]
+    
+    # 新增参数
+    g.m_days = 25      # 动量窗口
+    g.max_hold = 3     # 最大持仓数
+    g.stop_loss = 0.85 # 止损线
+    g.volatility_threshold = 0.25 # 波动率阈值
+    
+    # 修改交易时间为收盘前
+    run_daily(trade, '14:50') 
+
+def MOM(etf):
+    # 优化后的动量计算（增加波动率过滤）
+    df = attribute_history(etf, g.m_days, '1d', ['high','low','close'])
+    if len(df) < g.m_days:
+        return -np.inf
+        
+    # 计算年化波动率
+    returns = np.log(df['close']).diff().dropna()
+    volatility = returns.std() * np.sqrt(252)
+    if volatility > g.volatility_threshold:
+        return -np.inf
+    
+    # 优化动量计算（加入ATR调整）
+    high = df['high'].values
+    low = df['low'].values
+    close = df['close'].values
+    tr = np.maximum(high[1:]-low[1:], 
+                   np.abs(high[1:]-close[:-1]),
+                   np.abs(low[1:]-close[:-1]))
+    atr = np.mean(tr[-14:])  # 14日ATR
+    
+    y = np.log(close)
+    x = np.arange(len(y))
+    weights = np.linspace(1, 2, len(y))
+    slope = np.polyfit(x, y, 1, w=weights)[0]
+    annual_ret = math.exp(slope*250) - 1
+    
+    # 波动率调整后的动量得分
+    return annual_ret / (volatility + 1e-6) * (atr/close[-1])
+
+def get_rank(etf_pool):
+    scores = []
+    for etf in etf_pool:
+        try:
+            scores.append(MOM(etf))
+        except:
+            scores.append(-np.inf)
+    df = pd.DataFrame({'etf':etf_pool, 'score':scores})
+    return df.sort_values('score', ascending=False).etf.tolist()
+
+def trade(context):
+    # 账户风控检查
+    if context.portfolio.total_value < context.portfolio.starting_cash * g.stop_loss:
+        log.info("触发止损线，清仓")
+        for etf in context.portfolio.positions:
+            order_target_value(etf, 0)
+        return
+    
+    # 获取排名（动态持仓数量）
+    rank_list = get_rank(g.etf_pool)
+    valid_etfs = [etf for etf in rank_list if MOM(etf) > 0]
+    target_num = min(g.max_hold, len(valid_etfs))
+    target_list = valid_etfs[:target_num]
+    
+    # 卖出逻辑
+    for etf in context.portfolio.positions:
+        if etf not in target_list:
+            order_target_value(etf, 0)
+            log.info("卖出 {}".format(etf))
+    
+    # 买入逻辑（等风险分配）
+    if len(target_list) > 0:
+        position_value = context.portfolio.total_value * 0.99 / len(target_list)
+        for etf in target_list:
+            current_value = context.portfolio.positions[etf].value
+            if current_value < position_value * 0.9:  # 避免频繁调仓
+                order_target_value(etf, position_value)
+                log.info("调仓 {}".format(etf)) 

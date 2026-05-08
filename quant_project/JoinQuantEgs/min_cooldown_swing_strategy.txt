@@ -1,0 +1,95 @@
+小市值日线交易波段加冷静期年收益57%
+这一个策略是由P_T实盘改过来的。回撤收益好象P的还更高一些。在24年还有47%的收益。
+
+目标：小市值日线交易，叠加“分钟级风控（波段）+ 冷静期 + 空仓月（1/4月）”约束，力求在极端行情下控回撤、在强势阶段保持仓位。
+核心模块：
+候选池与选股：指数成分+ST/停牌/名称过滤+基本面（流通市值）+涨停过滤
+交易调度：固定日内时点买/卖，分钟级风控（波段）
+冷静期：连续N天（日收益≤阈值）触发，持有货币基金直至冷静期结束
+空仓月：1/4月不交易，自动用货币基金替代
+执行流与调度
+09:25 before_trading_start：生成候选池、拉取基本面、当日状态重置、空仓月边界处理、冷静期巡检
+09:31 buy_stocks：按等权买入（空仓月/冷静期内跳过）
+14:49 sell_stocks：卖出“非目标”持仓（冷静期内不卖货基；空仓月仅在月末卖货基）
+09:31–11:30、13:00–14:54 每分钟 interval_sell_buy：分钟风控（空仓月/冷静期内跳过）
+10:30、13:30、14:30 check_and_clean_stocks_in_cooldown：冷静期维持/退出
+09:30 download_sell：记录组合日收益，检测“连续N天下跌”触发冷静期
+候选池与选股（小市值）
+指数成分：g.index='399101.XSHE'
+过滤：
+get_current_data() 过滤 ST/停牌/名称含“退”“ST”“*ST”
+基本面：get_fundamentals 取 valuation.circulating_market_cap 等，过滤无效 PE 后，按流通市值升序
+当前流通市值近似：用当前价/昨收比例缩放昨日流通市值
+涨停过滤：剔除“当前涨停”的标的；已持有中的涨停票保留
+产出：根据 g.screen_stock_count 截断，再结合涨停持仓，得出“卖出/买入”各自需的列表数量
+买入与卖出
+买入 buy_stocks：
+空仓月/冷静期内不买
+等权分配：可用现金 ÷ 剩余目标持仓数
+卖出 sell_stocks：
+强制卖出 ST/退市
+非目标持仓卖出
+货币基金特殊规则：
+冷静期内：不卖
+空仓月内：仅在“月末最后一个交易日”卖出一次
+冷静期实现（重点）
+触发条件（连续N天跌幅）：
+参数：g.days（默认 3），g.return_threshold（默认 -0.02，即-2%）
+记录序列：g.portfolio_values 由 download_sell 每日09:30更新
+判定：最近 g.days 天的“每日收益”均 ≤ g.return_threshold → 触发
+进入冷静期（check_portfolio_decline）：
+清空所有股票，order_target_value 用全部现金买入 g.money_fund
+标记：g.in_cooldown=True，记录 g.last_sell_date、g.cooldown_count、g.cooldown_dates
+冷静期维持与退出（check_and_clean_stocks_in_cooldown）：
+天数计算按“交易日”：_trading_days_since_last_sell
+维持：
+清空所有非货基，避免回补
+仅当现金足够买入至少100股时才增持货基（按100股最小单位），否则保留现状并只记录金额
+退出：
+当“交易日”满 g.cooldown_days（默认5）时，若货基数量 ≥100 股则全部卖出；不足100股则保留
+退出后 g.in_cooldown=False
+在冷静期内：
+不执行 interval_sell_buy 分钟风控
+buy_stocks 直接返回，不下单
+波段/分钟风控（“涨则止盈，跌则回补”）
+模块：interval_sell_buy
+生效条件：仅在“非空仓月、非冷静期”时执行
+参照基准：昨收（get_price(..., count=1)）
+止盈：
+参数：g.uprate（默认 8.0，单位%）
+当当前价相对昨收涨幅 ≥ g.uprate 且当日未卖 -> 清仓该票（加入 g.today_sold_stocks 去重）
+回补（可选）：
+参数：g.downrate（默认 -3.0，单位%，设 None 可关闭）
+当跌幅 ≤ g.downrate 且当日未买/不在冷静期 -> 等额回补（按总资产/目标持仓数，且现金足够）
+空仓月（1/4月不交易）
+配置：g.empty_months=[1,4]
+月初首个交易日：_enforce_empty_month_start 清空股票，全仓买入 g.money_fund
+月末最后交易日：_enforce_empty_month_end 卖出 g.money_fund
+空仓月期间：
+buy_stocks 与 interval_sell_buy 均跳过
+sell_stocks 不卖货基（仅月末卖出一次）
+资金管理与下单
+股票：
+等权分配资金，order_target_value(code, per_value)
+货币基金：
+冷静期加仓时，现金不足以买 100 股则不下单，避免“平仓数量不能小于100”的错误
+冷静期结束卖出时，仓位不足 100 股则保留，不强制卖
+关键参数（默认）
+小市值：
+g.buy_stock_count=5、g.screen_stock_count=15
+分钟风控：
+g.uprate=8.0、g.downrate=-3.0
+冷静期（三连跌）：
+g.days=3、g.return_threshold=-0.02、g.cooldown_days=5
+空仓月：
+g.empty_months=[1,4]
+货币基金：
+g.money_fund='511880.XSHG'
+日志说明
+冷静期触发：会打印“连续N天跌幅触发冷静期：阈值=… 次数=… 日期=…”
+冷静期维护：只记录“持有金额”或“加仓后目标金额”，避免频繁下单失败
+空仓月边界：月初买入、月末卖出货基均有日志
+注意事项
+货币基金最小交易单位：100股。代码已在冷静期处理时遵守此限制
+交易日计算：冷静期天数采用“交易日”累积，更符合实盘口径
+未来函数：已避免使用当天未收盘日线数据，分钟逻辑仅用分时/昨日日线
