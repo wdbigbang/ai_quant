@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; data = open\\('d:/linux/ai_quant/ai_quant/quant_project/PtradeEgs/small_cap_strategy.py', 'rb'\\).read\\(\\); content = data.decode\\('utf-8-sig'\\); ast.parse\\(content\\); print\\('Syntax OK, lines:', len\\(content.splitlines\\(\\)\\)\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(r'd:\\\\linux\\\\ai_quant\\\\ai_quant\\\\quant_project\\\\PtradeEgs\\\\etf_rotation_strategy.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(r'd:\\\\linux\\\\ai_quant\\\\ai_quant\\\\quant_project\\\\PtradeEgs\\\\etf_rotation_strategy.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\(r'd:\\\\linux\\\\ai_quant\\\\ai_quant\\\\quant_project\\\\PtradeEgs\\\\small_cap_strategy.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Both files: Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(r'd:\\\\linux\\\\ai_quant\\\\ai_quant\\\\quant_project\\\\PtradeEgs\\\\etf_rotation_strategy.py', encoding='utf-8-sig'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python PtradeEgs/modify_etf_core.py)"
+    ]
+  }
+}

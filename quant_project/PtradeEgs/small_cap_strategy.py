@@ -1,4 +1,19 @@
-﻿# 小市值波段策略 v5.4 - PTrade版本（修复买入时间限制问题）
+﻿# 小市值波段策略 v5.6 - PTrade版本（多策略持仓校验模块集成）
+#
+# 【v5.6更新】多策略持仓校验模块集成
+# - 启动时全局校验：遍历所有策略持久化文件，进行账户-持仓一致性检查
+# - 精细化清理：合法持仓保留，不合法持仓删除，池外持仓删除
+# - 持久化字段扩展：新增strategy_name、pool_config字段
+# - 子目录名称简化：small_cap/（与strategy_name一致）
+# - 动态池支持：传入指数代码，校验模块动态查询成分股
+# - 回测模式跳过校验：避免无意义的全局校验开销
+#
+# 【v5.5更新】状态持久化+非交易日检测
+# - PTrade服务器周末重启后周一initialize()重新执行，所有g.*状态丢失
+# - 新增状态持久化：收盘后保存关键状态到JSON文件，initialize()时加载恢复
+# - 新增非交易日检测：周末/节假日自动跳过，防止非交易日运行策略
+# - 仅实盘模式生效（回测不触发，不影响回测行为）
+# - 文件损坏/丢失时自动回退默认值，不崩溃
 #
 # 【v5.4更新】修复买入时间限制问题
 # - 原问题：买入固定在09:31，模拟错过该时间点就无法买入
@@ -32,22 +47,30 @@
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+import json
+import uuid
 
 
 def initialize(context):
     log.info("=" * 70)
-    log.info("=== 小市值策略 v5.4 初始化 ===")
-    
+    log.info("=== 小市值策略 v5.6 初始化（多策略持仓校验模块集成）===")
+
+    # ===== 0. 策略信息声明（多策略校验模块使用）=====
+    g.strategy_name = 'small_cap'  # 策略名称（子目录名）
+
     set_benchmark("000300.XSHG")
-    
+
     # 指数和持仓参数
     g.index = "399101.XBHS"
     g.buy_stock_count = 7
     g.screen_stock_count = 15
     g.down_stock_count = 15
+
+    # ===== 股票池配置（校验模块使用）=====
+    g.pool_config = {'type': 'index', 'value': g.index}  # 动态池：指数成分股
     
     # ==================== 资金上限参数 ====================
-    g.capital_ratio = 0.5  # 策略可用资金比例（1.0=100%，0.5=50%）
+    g.capital_ratio = 1.0  # 策略可用资金比例（1.0=100%，0.5=50%）
     log.info("[资金上限] 策略可用资金比例: %.0f%%" % (g.capital_ratio * 100))
     
     # ROE筛选参数
@@ -99,10 +122,42 @@ def initialize(context):
     # ==================== 当天买入标志位（v5.4新增）====================
     g.buy_done_today = False        # 当天是否已完成买入（避免重复买入）
     g.first_handle_data_done = False  # 当天首次handle_data是否已执行（用于冷静期/空仓月清仓）
-    
+
+    # ==================== v5.5新增：策略UUID + 持仓归属追踪 ====================
+    g.strategy_uuid = uuid.uuid4().hex[:8]  # 策略唯一标识（首次生成，_load_state会覆盖）
+    g.owned_positions = {}                   # {code: amount} 只追踪本策略买入的持仓
+
     if not is_trade():
         set_backtest()
-    
+
+    # ==================== v5.5新增：加载持久化状态 ====================
+    # PTrade服务器周末重启后周一initialize()重新执行，需要从文件恢复状态
+    _load_state(context)
+
+    # ==================== v5.6新增：全局持仓校验 ====================
+    # 仅实盘模式执行（校验模块已移除os依赖）
+    if is_trade():
+        try:
+            # 添加策略目录到Python搜索路径（解决导入失败问题）
+            import sys
+            sys.path.insert(0, get_research_path())
+            from shared_position_validator import validate_strategy_positions
+            g.owned_positions = validate_strategy_positions(
+                context,
+                g.strategy_name,
+                g.pool_config,
+                g.owned_positions,
+                log_func=log.info,
+                is_trade_func=is_trade
+            )
+            # 保存校验后的合法持仓
+            _save_state(context)
+        except Exception as e:
+            log.warning("[校验] 校验模块调用失败: %s，使用原始持仓" % str(e))
+
+    # ==================== 检查账户已有持仓（警告日志）====================
+    _check_existing_positions(context)
+
     log.info("[参数] 指数: %s" % g.index)
     log.info("[参数] 持仓数量: %d, 筛选数量: %d" % (g.buy_stock_count, g.screen_stock_count))
     log.info("[参数] ROE筛选: %s, 阈值: %s" % (g.roe_filter, g.roe_threshold))
@@ -127,6 +182,238 @@ def set_backtest():
 def _get_prev_trade_day(context):
     """获取昨日日期字符串"""
     return context.previous_date
+
+
+def _get_state_file_path():
+    """获取状态持久化文件路径（独立子目录）"""
+    base_path = get_research_path()
+    strategy_dir = "small_cap/"  # 简化目录名（策略名称）
+    create_dir(strategy_dir)
+    return base_path + strategy_dir + "state.json"
+
+
+def _save_state(context):
+    """
+    保存策略状态到JSON文件
+
+    仅实盘模式执行，回测模式跳过。
+    收盘后调用，保存关键变量。
+    """
+    if not is_trade():
+        return
+
+    state = {
+        'version': 2,  # 版本升级（支持校验模块）
+        'strategy_name': g.strategy_name,  # 策略名称（新增）
+        'pool_config': g.pool_config,  # 股票池配置（新增）
+        'saved_date': context.blotter.current_dt.strftime('%Y-%m-%d'),
+        'in_cooldown': g.in_cooldown,
+        'last_sell_date': g.last_sell_date,
+        'sold_stocks_dates': g.sold_stocks_dates,
+        'cooldown_count': g.cooldown_count,
+        'cooldown_dates': g.cooldown_dates,
+        'portfolio_values': g.portfolio_values,
+        'strategy_uuid': g.strategy_uuid,
+        'owned_positions': g.owned_positions,
+    }
+
+    try:
+        state_path = _get_state_file_path()
+        # 直接写入文件（PTrade禁止使用os.replace）
+        with open(state_path, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        log.info("[状态持久化] 保存成功: cooldown=%s, last_sell=%s"
+                 % (g.in_cooldown, g.last_sell_date))
+    except Exception as e:
+        log.warning("[状态持久化] 保存失败: %s" % str(e))
+
+
+def _load_state(context):
+    """
+    从JSON文件加载策略状态（带验证和过期清理）
+
+    仅实盘模式执行，回测模式跳过。
+    在initialize()中调用，覆盖默认值恢复上交易日状态。
+    文件不存在/损坏/版本不匹配 → 使用默认值，不崩溃。
+    """
+    if not is_trade():
+        log.info("[状态持久化] 回测模式，跳过状态加载")
+        return
+
+    try:
+        state_path = _get_state_file_path()
+        # 直接尝试打开文件（FileNotFoundError会被捕获）
+        with open(state_path, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+
+        # 版本检查（兼容version 1和version 2）
+        version = state.get('version', 0)
+        if version not in [1, 2]:
+            log.warning("[状态持久化] 版本不匹配(v%s)，使用默认值"
+                        % version)
+            return
+
+        saved_date = state.get('saved_date', '')
+        log.info("[状态持久化] 加载状态(v%d): saved_date=%s" % (version, saved_date))
+
+        # 恢复状态变量（带类型验证）
+        g.in_cooldown = bool(state.get('in_cooldown', False))
+        g.last_sell_date = state.get('last_sell_date', None)
+
+        loaded_sold = state.get('sold_stocks_dates', {})
+        if isinstance(loaded_sold, dict):
+            g.sold_stocks_dates = loaded_sold
+        else:
+            g.sold_stocks_dates = {}
+
+        g.cooldown_count = int(state.get('cooldown_count', 0))
+
+        loaded_dates = state.get('cooldown_dates', [])
+        if isinstance(loaded_dates, list):
+            g.cooldown_dates = loaded_dates
+        else:
+            g.cooldown_dates = []
+
+        loaded_values = state.get('portfolio_values', [])
+        if isinstance(loaded_values, list) and len(loaded_values) <= 4:
+            g.portfolio_values = loaded_values
+        else:
+            g.portfolio_values = []
+
+        # 清理过期sold_stocks_dates（超过2×cooldown_days日历天）
+        current_trading_day = get_trading_day(0)
+        expired_keys = []
+        for code, sell_date_str in g.sold_stocks_dates.items():
+            try:
+                sell_date = datetime.strptime(sell_date_str, '%Y-%m-%d').date()
+                days_elapsed = (current_trading_day - sell_date).days
+                if days_elapsed > g.sell_cooldown_days * 2:
+                    expired_keys.append(code)
+            except Exception:
+                expired_keys.append(code)
+
+        for code in expired_keys:
+            del g.sold_stocks_dates[code]
+
+        if expired_keys:
+            log.info("[状态持久化] 清理过期卖出记录: %d只" % len(expired_keys))
+
+        # 恢复UUID和持仓归属
+        loaded_uuid = state.get('strategy_uuid', '')
+        if loaded_uuid:
+            g.strategy_uuid = loaded_uuid
+        log.info("[策略UUID] 恢复: %s" % g.strategy_uuid)
+
+        loaded_owned = state.get('owned_positions', {})
+        if isinstance(loaded_owned, dict):
+            g.owned_positions = loaded_owned
+        else:
+            g.owned_positions = {}
+
+        # version 2新增字段
+        if version >= 2:
+            loaded_name = state.get('strategy_name')
+            if loaded_name:
+                g.strategy_name = loaded_name
+            loaded_pool = state.get('pool_config')
+            if loaded_pool and isinstance(loaded_pool, dict):
+                g.pool_config = loaded_pool
+
+        log.info("[状态持久化] 恢复成功: cooldown=%s, last_sell=%s, cooldown_count=%d, portfolio_values=%d条, owned=%d只"
+                 % (g.in_cooldown, g.last_sell_date, g.cooldown_count, len(g.portfolio_values), len(g.owned_positions)))
+
+    except (json.JSONDecodeError, ValueError) as e:
+        log.warning("[状态持久化] 状态文件损坏，使用默认值: %s" % str(e))
+    except Exception as e:
+        log.warning("[状态持久化] 加载失败，使用默认值: %s" % str(e))
+
+
+def _is_owned(code):
+    """检查代码是否在本策略的owned_positions中"""
+    return code in g.owned_positions
+
+
+def _get_owned_amount(code, context):
+    """获取本策略持有的实际数量（min(虚拟, 实际)，防止虚拟>实际）"""
+    if code not in g.owned_positions:
+        return 0
+    virtual_amount = g.owned_positions[code]
+    real_amount = 0
+    if code in context.portfolio.positions:
+        real_amount = context.portfolio.positions[code].amount
+    return min(virtual_amount, real_amount)
+
+
+def _get_owned_enable_amount(code, context):
+    """获取本策略持有的可卖数量（min(虚拟可卖, 实际可卖)）"""
+    if code not in g.owned_positions:
+        return 0
+    virtual_amount = g.owned_positions[code]
+    pos = context.portfolio.positions.get(code)
+    if pos is None:
+        return 0
+    real_enable = pos.enable_amount if hasattr(pos, 'enable_amount') else pos.amount
+    return min(virtual_amount, real_enable)
+
+
+def _sync_owned_positions(context):
+    """
+    同步owned_positions与实际持仓（盘前调用）
+
+    只删除已不在实际持仓中的条目，不添加新条目（防止纳入其他策略持仓）。
+    更新数量为实际持仓量（保守取min）。
+    """
+    removed = []
+    updated = []
+    for code in list(g.owned_positions.keys()):
+        if code not in context.portfolio.positions or context.portfolio.positions[code].amount <= 0:
+            removed.append(code)
+            del g.owned_positions[code]
+        elif code == g.money_fund:
+            # 货币基金由冷静期/空仓月管理，不纳入持仓追踪
+            removed.append(code)
+            del g.owned_positions[code]
+        else:
+            real_amount = context.portfolio.positions[code].amount
+            if g.owned_positions[code] != real_amount:
+                g.owned_positions[code] = min(g.owned_positions[code], real_amount)
+                updated.append(code)
+
+    if removed:
+        log.info("[持仓追踪] 清理已清仓: %s" % ','.join(removed))
+    if updated:
+        log.info("[持仓追踪] 同步数量: %s" % ','.join(updated))
+    if g.owned_positions:
+        log.info("[持仓追踪] 当前持有%d只: %s" % (len(g.owned_positions), ','.join(g.owned_positions.keys())))
+
+
+def _check_existing_positions(context):
+    """
+    检查账户已有持仓（仅实盘，initialize()中调用）
+
+    如果账户有非货币基金持仓且不在owned_positions中，打印警告。
+    提醒用户手动清仓后再启动策略。
+    """
+    if not is_trade():
+        return
+
+    orphan_positions = []
+    for code, pos in context.portfolio.positions.items():
+        if pos.amount <= 0:
+            continue
+        if code == g.money_fund:
+            continue
+        if code not in g.owned_positions:
+            orphan_positions.append(code)
+
+    if orphan_positions:
+        log.warning("[策略UUID:%s] 检测到账户已有%d只持仓不在本策略管理中: %s"
+                    % (g.strategy_uuid, len(orphan_positions), ','.join(orphan_positions)))
+        log.warning("[策略UUID:%s] 请手动清仓后再启动策略，否则策略将忽略这些持仓"
+                    % g.strategy_uuid)
+
+    # 打印UUID标识
+    log.info("[策略UUID] %s, 持仓追踪: %d只" % (g.strategy_uuid, len(g.owned_positions)))
 
 
 def _filter_st_pause_delist(codes):
@@ -234,10 +521,11 @@ def _execute_cooldown_clear(context, data):
     """
     current_time = context.blotter.current_dt.strftime('%H:%M')
     log.info("[%s] 冷静期清仓..." % current_time)
-    
-    for code, pos in list(context.portfolio.positions.items()):
+
+    # 只清仓本策略的持仓，不影响其他策略或手动交易
+    for code in list(g.owned_positions.keys()):
         try:
-            enable_amount = pos.enable_amount if hasattr(pos, 'enable_amount') else pos.amount
+            enable_amount = _get_owned_enable_amount(code, context)
             if enable_amount > 0:
                 remaining = enable_amount
                 while remaining > 0:
@@ -250,9 +538,12 @@ def _execute_cooldown_clear(context, data):
                         if remaining > 0:
                             order(code, -remaining)
                             break
+                # 从持仓追踪中删除
+                del g.owned_positions[code]
+                log.info("[冷静期] 卖出 %s: %d股" % (code, enable_amount))
         except Exception as e:
             log.error("[冷静期] 卖出失败 %s: %s" % (code, str(e)))
-    
+
     cash = context.portfolio.cash
     if cash > 0:
         try:
@@ -274,23 +565,26 @@ def _execute_empty_month_clear(context, data):
     """
     current_time = context.blotter.current_dt.strftime('%H:%M')
     log.info("[%s] 空仓月清仓..." % current_time)
-    
-    for code, pos in list(context.portfolio.positions.items()):
+
+    # 只清仓本策略的持仓，不影响其他策略或手动交易
+    for code in list(g.owned_positions.keys()):
         try:
-            if code != g.money_fund:
-                enable_amount = pos.enable_amount if hasattr(pos, 'enable_amount') else pos.amount
-                if enable_amount > 0:
-                    remaining = enable_amount
-                    while remaining > 0:
-                        batch = min(remaining, 900000)
-                        batch = int(batch / 100) * 100
-                        if batch > 0:
-                            order(code, -batch)
-                            remaining -= batch
-                        else:
-                            if remaining > 0:
-                                order(code, -remaining)
-                                break
+            enable_amount = _get_owned_enable_amount(code, context)
+            if enable_amount > 0:
+                remaining = enable_amount
+                while remaining > 0:
+                    batch = min(remaining, 900000)
+                    batch = int(batch / 100) * 100
+                    if batch > 0:
+                        order(code, -batch)
+                        remaining -= batch
+                    else:
+                        if remaining > 0:
+                            order(code, -remaining)
+                            break
+                # 从持仓追踪中删除
+                del g.owned_positions[code]
+                log.info("[空仓月] 卖出 %s: %d股" % (code, enable_amount))
         except Exception as e:
             log.error("[空仓月] 卖出失败 %s: %s" % (code, str(e)))
     
@@ -305,35 +599,31 @@ def _execute_empty_month_clear(context, data):
 
 def _get_strategy_assets(context, data):
     """
-    计算策略资产（股票持仓市值，排除货币基金）
-    
-    用于组合跌幅检查，只计算策略相关的资产变化：
-    - 策略资产 = 持仓股票市值（排除货币基金）
-    - 不含现金（现金不波动）
-    - 不含货币基金（冷静期/空仓月持有）
-    
+    计算策略资产（只计算本策略owned_positions中的持仓市值）
+
+    用于组合跌幅检查，只计算本策略相关的资产变化：
+    - 策略资产 = owned_positions持仓市值
+    - 不含现金、货币基金、其他策略持仓、手动交易持仓
+
     返回：策略资产市值（元）
     """
     total = 0.0
-    for code, pos in context.portfolio.positions.items():
-        if pos.amount <= 0:
-            continue
-        # 排除货币基金
-        if code == g.money_fund:
+    for code in g.owned_positions:
+        amount = _get_owned_amount(code, context)
+        if amount <= 0:
             continue
         # 获取当前价格
         try:
             if code in data:
                 price = data[code].price
             else:
-                # 盘前没有data，用昨收价
                 his = get_history(1, frequency='1d', field='close', security_list=code, fq=None, include=False, is_dict=True)
                 if his and code in his:
                     price = float(his[code]['close'][-1])
                 else:
                     price = 0
             if price > 0:
-                total += pos.amount * price
+                total += amount * price
         except:
             pass
     return total
@@ -517,11 +807,31 @@ def _filter_by_roe_improve(context, stock_list):
 
 def before_trading_start(context, data):
     """盘前处理"""
+
+    # ==================== v5.5新增：非交易日检测 ====================
+    # PTrade服务器周末重启后可能在非交易日拉起策略，需要跳过执行
+    # get_trading_day(0)在非交易日返回上一交易日，与当前日期不同即非交易日
+    if is_trade():
+        try:
+            current_date = context.blotter.current_dt.date()
+            trading_day = get_trading_day(0)
+            if current_date != trading_day:
+                log.warning("[盘前] %s 是非交易日（交易日=%s），跳过执行"
+                           % (current_date, trading_day))
+                g.handle_data_flag = False
+                g.buy_done_today = True
+                return
+        except Exception as e:
+            log.warning("[盘前] 非交易日检测异常，继续执行: %s" % str(e))
+
     g.today_bought_stocks = set()
     g.today_sold_stocks = set()
     g.current_date = _get_prev_trade_day(context)
     g.handle_data_flag = True
-    
+
+    # ==================== v5.5新增：同步持仓归属 ====================
+    _sync_owned_positions(context)
+
     # ==================== v5.4新增：每天重置买入标志位 ====================
     g.buy_done_today = False
     g.first_handle_data_done = False
@@ -537,17 +847,25 @@ def before_trading_start(context, data):
             g.trigger_empty_month = True
             log.info("[盘前] %s 空仓月开始" % date_str)
         g.df2 = None
+        owned_held = [c for c in g.owned_positions if _get_owned_amount(c, context) > 0]
+        log.info("[盘前铃声] %s | 总资产=%.2f 现金=%.2f | 本策略持仓%d只 | 空仓月"
+                 % (date_str, context.portfolio.portfolio_value, context.portfolio.cash, len(owned_held)))
         return
-    
+
     # 冷静期处理
     if g.in_cooldown:
         log.info("[盘前] %s 冷静期 %d/%d" % (date_str, g.days_since_sell, g.cooldown_days))
         g.df2 = None
+        owned_held = [c for c in g.owned_positions if _get_owned_amount(c, context) > 0]
+        log.info("[盘前铃声] %s | 总资产=%.2f 现金=%.2f | 本策略持仓%d只 | 冷静期%d/%d"
+                 % (date_str, context.portfolio.portfolio_value, context.portfolio.cash,
+                    len(owned_held), g.days_since_sell, g.cooldown_days))
         return
     
     # 盘前预存昨除权价
     g.yesterday_close = {}
-    hold_codes = [s for s, p in context.portfolio.positions.items() if p.amount > 0]
+    # 只获取本策略持仓的昨收价，不包含其他策略或手动交易的持仓
+    hold_codes = [code for code in g.owned_positions if _get_owned_amount(code, context) > 0]
     
     for code in hold_codes:
         try:
@@ -580,21 +898,26 @@ def before_trading_start(context, data):
     
     # ==================== 选股流程 ====================
     stock_pool = _get_universe(context)
+    log.info("[选股] 指数成分: %d只" % len(stock_pool))
     if not stock_pool:
         log.warning("[选股] 股票池为空")
         g.df2 = None
         return
-    
+
     # ROE筛选
     if g.roe_filter:
+        before_roe = len(stock_pool)
         stock_pool = _filter_by_roe(context, stock_pool)
+        log.info("[选股] ROE筛选: %d只 → %d只" % (before_roe, len(stock_pool)))
         if not stock_pool:
             g.df2 = None
             return
-    
+
     # ROE改善筛选
     if g.roe_improve_filter:
+        before_roe_improve = len(stock_pool)
         stock_pool = _filter_by_roe_improve(context, stock_pool)
+        log.info("[选股] ROE改善筛选: %d只 → %d只" % (before_roe_improve, len(stock_pool)))
         if not stock_pool:
             g.df2 = None
             return
@@ -624,6 +947,13 @@ def before_trading_start(context, data):
         set_universe(stock_codes)
         
         log.info("[选股] 最终数量: %d" % len(g.df2))
+
+        # ==================== 盘前铃声汇总 ====================
+        owned_held = [c for c in g.owned_positions if _get_owned_amount(c, context) > 0]
+        strategy_assets = _get_strategy_assets(context, data)
+        log.info("[盘前铃声] %s | 总资产=%.2f 策略资产=%.2f 现金=%.2f | 本策略持仓%d只: %s | 选标=%d只"
+                 % (date_str, context.portfolio.portfolio_value, strategy_assets, context.portfolio.cash,
+                    len(owned_held), ','.join(owned_held) if owned_held else '空仓', len(g.df2)))
     except Exception as e:
         log.error("[选股] 市值数据失败: %s" % str(e))
         g.df2 = None
@@ -713,8 +1043,8 @@ def buy_stocks(context, data):
         g.buy_done_today = True  # 无目标股票也标记为完成
         return
     
-    # 已持仓
-    held = [s for s, p in context.portfolio.positions.items() if p.amount > 0]
+    # 已持仓（只计算本策略owned_positions中的持仓）
+    held = [code for code in g.owned_positions if _get_owned_amount(code, context) > 0]
     need_num = g.buy_stock_count - len(held)
     
     if need_num <= 0:
@@ -756,6 +1086,13 @@ def buy_stocks(context, data):
             held.append(code)
             need_num -= 1
             bought_count += 1
+
+            # ==================== v5.5新增：记录买入到持仓追踪 ====================
+            estimated_shares = int(per_value / price / 100) * 100 if price > 0 else 0
+            if estimated_shares > 0:
+                g.owned_positions[code] = estimated_shares
+
+            log.info("[买入] %s: 价格=%.2f, 预估%.2f元/%d股" % (code, price, per_value, estimated_shares))
             
             # 买入后存储昨除权价
             if code not in g.yesterday_close:
@@ -795,55 +1132,67 @@ def sell_stocks(context, data):
     target_set = set(targets)
     
     sold_count = 0
-    for code, pos in list(context.portfolio.positions.items()):
+    # 只遍历本策略的持仓，不处理其他策略或手动交易的持仓
+    for code in list(g.owned_positions.keys()):
         try:
-            if pos.amount <= 0:
+            enable_amount = _get_owned_enable_amount(code, context)
+            if enable_amount <= 0:
                 continue
-            
-            enable_amount = pos.enable_amount if hasattr(pos, 'enable_amount') else pos.amount
-            
-            # 货币基金处理
+
+            # 货币基金处理（货币基金不在owned_positions中，由冷静期/空仓月管理）
             if code == g.money_fund:
-                if g.in_cooldown:
-                    continue
-                if _is_empty_month(context) and _is_last_trading_day_in_month(context) and enable_amount > 0:
-                    remaining = enable_amount
-                    while remaining > 0:
-                        batch = min(remaining, 900000)
-                        batch = int(batch / 100) * 100
-                        if batch > 0:
-                            order(code, -batch)
-                            remaining -= batch
-                        else:
-                            if remaining > 0:
-                                order(code, -remaining)
-                            break
-                    log.info('[14:49] 空仓月月末，卖出货基')
                 continue
-            
+
             # 不在目标列表中则卖出
             if code not in target_set:
-                if enable_amount > 0:
-                    remaining = enable_amount
-                    while remaining > 0:
-                        batch = min(remaining, 900000)
-                        batch = int(batch / 100) * 100
-                        if batch > 0:
-                            order(code, -batch)
-                            remaining -= batch
-                        else:
-                            if remaining > 0:
-                                order(code, -remaining)
-                            break
-                    
-                    g.today_sold_stocks.add(code)
-                    g.last_sell_date = context.blotter.current_dt.strftime('%Y-%m-%d')
-                    sold_count += 1
+                log.info("[卖出] %s: 不在目标列表, 可卖%d股" % (code, enable_amount))
+                remaining = enable_amount
+                while remaining > 0:
+                    batch = min(remaining, 900000)
+                    batch = int(batch / 100) * 100
+                    if batch > 0:
+                        order(code, -batch)
+                        remaining -= batch
+                    else:
+                        if remaining > 0:
+                            order(code, -remaining)
+                        break
+
+                g.today_sold_stocks.add(code)
+                g.last_sell_date = context.blotter.current_dt.strftime('%Y-%m-%d')
+                sold_count += 1
+                # 从持仓追踪中删除
+                if code in g.owned_positions:
+                    del g.owned_positions[code]
         except Exception as e:
             log.error('[卖出] %s 异常: %s' % (code, str(e)))
     
     if sold_count > 0:
         log.info("[14:49] 完成: 卖出%d只" % sold_count)
+
+    # ==================== 空仓月最后交易日：卖出货基（退出空仓月）====================
+    # 货币基金不在g.owned_positions中，需要单独处理
+    # v5.4原逻辑：空仓月最后交易日的14:49卖出货基，5月才能重新买入股票
+    if _is_empty_month(context) and _is_last_trading_day_in_month(context):
+        if not g.in_cooldown and g.money_fund in context.portfolio.positions:
+            try:
+                pos = context.portfolio.positions[g.money_fund]
+                enable_amount = pos.enable_amount if hasattr(pos, 'enable_amount') else pos.amount
+                if enable_amount >= 100:
+                    remaining = enable_amount
+                    while remaining > 0:
+                        batch = min(remaining, 900000)
+                        batch = int(batch / 100) * 100
+                        if batch > 0:
+                            order(g.money_fund, -batch)
+                            remaining -= batch
+                        else:
+                            if remaining > 0:
+                                order(g.money_fund, -remaining)
+                            break
+                    log.info("[14:49] 空仓月月末，卖出货基%d股" % enable_amount)
+            except Exception as e:
+                log.error('[卖出] 空仓月月末卖货基失败: %s' % str(e))
 
 
 # ============================================================
@@ -907,7 +1256,7 @@ def _get_trade_stocks(context, data, mode='sell'):
     stocks = [s for s in stocks if s not in up_limit_stock]
     
     # 已持仓中涨停的保留
-    hold_codes = list(context.portfolio.positions.keys())
+    hold_codes = list(g.owned_positions.keys())
     lim_hold = _limit_flags_today(context, hold_codes)
     hold_up = set(lim_hold['up_limit'])
     
@@ -932,59 +1281,58 @@ def interval_sell_buy(context, data):
     
     today_str = str(context.blotter.current_dt.date())
     
-    for code, pos in list(context.portfolio.positions.items()):
+    for code in list(g.owned_positions.keys()):
         try:
-            if pos.amount <= 0:
+            amount = _get_owned_amount(code, context)
+            if amount <= 0:
                 continue
-            if code == g.money_fund:
-                continue
-            
+
             # ==================== T+1检查：使用enable_amount ====================
-            # enable_amount = 可卖数量（T+1后才有值）
-            # amount = 总持仓数量（买入后立即增加）
-            enable_amount = pos.enable_amount if hasattr(pos, 'enable_amount') else pos.amount
-            
+            enable_amount = _get_owned_enable_amount(code, context)
+
             if enable_amount <= 0:
-                # 当日买入的股票，enable_amount=0，不能卖出
                 continue
-            
+
             # ==================== 涨幅计算（除权价体系）====================
             yclose = g.yesterday_close.get(code, 0)
-            
+
             if yclose <= 0:
                 continue
-            
+
             # 当前除权价
             if code not in data:
                 continue
-            
+
             current_price = data[code].price
-            
+
             # 涨幅 = 当前除权价 / 昨除权价 - 1
             pct = (current_price / yclose - 1.0) * 100.0
-            
+
             # 止盈（只在触发时打印）
             if pct >= g.uprate and code not in g.today_sold_stocks:
-                log.info('[止盈触发] %s: 昨收=%.3f, 当前=%.3f, 涨幅=%.2f%%, 可卖=%d股' 
+                log.info('[止盈触发] %s: 昨收=%.3f, 当前=%.3f, 涨幅=%.2f%%, 可卖=%d股'
                          % (code, yclose, current_price, pct, enable_amount))
-                
+
                 # ==================== 拆单卖出 ====================
                 remaining = enable_amount
                 while remaining > 0:
-                    batch = min(remaining, 900000)  # 单笔最大90万股
-                    batch = int(batch / 100) * 100  # 向下取整到100股
+                    batch = min(remaining, 900000)
+                    batch = int(batch / 100) * 100
                     if batch > 0:
                         order(code, -batch)
                         remaining -= batch
                     else:
-                        # 剩余不足100股，一次卖出
                         if remaining > 0:
                             order(code, -remaining)
                         break
-                
+
                 g.today_sold_stocks.add(code)
                 g.sold_stocks_dates[code] = today_str
                 g.last_sell_date = today_str
+                # 从持仓追踪中删除
+                if code in g.owned_positions:
+                    del g.owned_positions[code]
+                log.info("[止盈] %s: 已下单卖出%d股" % (code, enable_amount))
         except Exception as e:
             log.error('分钟止盈处理失败 %s: %s' % (code, str(e)))
 
@@ -1068,6 +1416,7 @@ def check_and_clean_stocks_in_cooldown(context, data):
                 pos = context.portfolio.positions[g.money_fund]
                 enable_amount = pos.enable_amount if hasattr(pos, 'enable_amount') else pos.amount
                 if enable_amount >= 100:
+                    log.info("[冷静期] 到期退出, 卖出货基%d股" % enable_amount)
                     remaining = enable_amount
                     while remaining > 0:
                         batch = min(remaining, 900000)
@@ -1084,13 +1433,11 @@ def check_and_clean_stocks_in_cooldown(context, data):
         g.in_cooldown = False
         return
     
-    # 冷静期内清空股票
+    # 冷静期内清空本策略的股票持仓
     sold_codes = []
-    for code, pos in list(context.portfolio.positions.items()):
-        if code == g.money_fund:
-            continue
+    for code in list(g.owned_positions.keys()):
         try:
-            enable_amount = pos.enable_amount if hasattr(pos, 'enable_amount') else pos.amount
+            enable_amount = _get_owned_enable_amount(code, context)
             if enable_amount > 0:
                 remaining = enable_amount
                 while remaining > 0:
@@ -1104,6 +1451,8 @@ def check_and_clean_stocks_in_cooldown(context, data):
                             order(code, -remaining)
                         break
                 sold_codes.append(code)
+                del g.owned_positions[code]
+                log.info("[冷静期检查] 卖出 %s: %d股" % (code, enable_amount))
         except Exception as e:
             log.error('[冷静期] 卖出失败 %s: %s' % (code, str(e)))
     
@@ -1125,7 +1474,24 @@ def check_and_clean_stocks_in_cooldown(context, data):
 
 def after_trading_end(context, data):
     """盘后处理"""
+    # 同步owned_positions中的实际数量（保守取min）
+    for code in list(g.owned_positions.keys()):
+        if code in context.portfolio.positions:
+            real_amount = context.portfolio.positions[code].amount
+            g.owned_positions[code] = min(g.owned_positions[code], real_amount)
+
     positions = context.portfolio.positions
     hold_count = len([p for p in positions.values() if p.amount > 0])
-    log.info("[盘后] 持仓%d只, 总资产%.2f, 现金%.2f" 
-             % (hold_count, context.portfolio.portfolio_value, context.portfolio.cash))
+    owned_count = len([c for c in g.owned_positions if context.portfolio.positions.get(c) and context.portfolio.positions[c].amount > 0])
+    log.info("[盘后] 账户持仓%d只, 本策略持仓%d只, 总资产%.2f, 现金%.2f"
+             % (hold_count, owned_count, context.portfolio.portfolio_value, context.portfolio.cash))
+
+    # ==================== 当日交易汇总 ====================
+    bought_list = sorted(g.today_bought_stocks)
+    sold_list = sorted(g.today_sold_stocks)
+    log.info("[盘后汇总] 今日买入%d只: %s | 卖出%d只: %s"
+             % (len(bought_list), ','.join(bought_list) if bought_list else '无',
+                len(sold_list), ','.join(sold_list) if sold_list else '无'))
+
+    # ==================== v5.5新增：保存持久化状态 ====================
+    _save_state(context)
