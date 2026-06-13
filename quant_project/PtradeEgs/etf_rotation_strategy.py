@@ -972,6 +972,22 @@ def handle_data(context, data):
 # ============ 盘后处理 ============
 def after_trading_end(context, data):
     """盘后同步+持久化"""
+
+    # ========== 盘后强制同步持仓（v3.3.1新增）==========
+    # 解决：盘中买入成交确认遗漏的问题
+    buy_retry_flag = getattr(g, 'buy_retry_flag', False)
+    if buy_retry_flag and hasattr(g, 'target_etfs') and g.target_etfs:
+        # 有重试标志，检查账户真实持仓
+        for etf in g.target_etfs:
+            real_pos = context.portfolio.positions.get(etf)
+            actual_shares = real_pos.amount if real_pos else 0
+
+            if actual_shares > 0 and etf not in g.owned_positions:
+                # 有实际持仓但策略未追踪，强制同步
+                g.owned_positions[etf] = actual_shares
+                log.info("[盘后强制同步] [%s] 发现实际持仓%d股，强制更新owned_positions"
+                         % (etf, actual_shares))
+
     _sync_owned_positions(context)
 
     # 实盘才保存状态，回测不保存

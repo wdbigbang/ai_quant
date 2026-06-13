@@ -1,4 +1,4 @@
-# ETF核心资产轮动策略（安全摸狗策略）v1.5 - PTrade版本
+# ETF核心资产轮动策略（安全摸狗策略）v1.5.2 - PTrade版本
 # ==============================
 #
 # 【策略概述】
@@ -10,15 +10,45 @@
 # - 重试机制1：09:31-35每分钟检查，未成交则重试（最多4次）
 # - 二次尝试：10:30-35专门处理跨境ETF延迟开盘（如纳指ETF 513100）
 # - 重试机制2：10:30-35每分钟检查，未成交则重试（最多4次）
+# - **盘中成交确认**（v1.5.1新增）：交易时间每分钟检查成交情况，避免遗漏
+# - **盘后强制同步**（v1.5.1新增）：盘后从账户真实持仓强制同步，确保owned_positions准确
 # - 持仓数量：仅1只（动量得分最高且在安全区间内）
 # - 动量计算：加权线性回归（25天，近期权重更大）
 # - 打分公式：年化收益 × R²
 # - 安全区过滤：score > 0 且 <= 5（避免追高风险）
 # - 资金上限：g.capital_ratio 控制策略可用资金比例
 #
+# 【v1.5.2更新】（跨境ETF卖出bug修复）
+# - **修复严重bug：跨境ETF卖出时owned_positions立即删除，导致持仓不一致**
+#   - 问题：跨境ETF（如513100.SS纳指ETF）10:30开盘，但策略9:30尝试卖出
+#   - 原因：卖出逻辑没有对齐买入的保护机制，立即删除owned_positions
+#   - 解决方案：对齐买入逻辑的完整保护机制
+#     1. 卖出订单跟踪：新增g.sell_orders列表记录卖出订单
+#     2. 跨境ETF判断：卖出前检查开盘时间，识别"未开盘"vs"停牌"
+#     3. 延迟删除：等待成交确认后才删除owned_positions
+#     4. 成交确认：check_and_retry()检查卖出成交，未成交则重试
+#     5. 盘后同步：after_trading_end()处理未确认的卖出订单
+# - **优化卖出保护机制**：
+#   - 卖出前判断跨境ETF开盘时间，智能处理"未开盘"场景
+#   - 10:30二次尝试触发条件扩展：增加卖出失败检查
+#   - 盘后强制同步卖出订单：确保owned_positions与实际持仓一致
+#
+# 【v1.5.1更新】（持仓追踪bug修复）
+# - **修复严重bug：买入成交后持仓未被记录**
+#   - 问题：用户在11:12买入，下单成功成交，但owned_positions为空
+#   - 原因：重试机制只在09:31-35和10:30-35触发，其他时间买入后成交确认遗漏
+#   - 解决方案：三重保障机制
+#     1. 盘中成交确认：交易时间（09:30-15:00）每分钟检查下单记录的成交情况
+#     2. 盘后强制同步：盘后检查账户真实持仓，强制更新owned_positions
+#     3. 账户持仓对照：盘后汇总显示账户真实持仓，对比策略追踪持仓，发现不一致时警告
+# - **优化日志输出**：
+#   - 盘后强制同步日志：清晰提示持仓同步情况
+#   - 账户真实持仓显示：标记池内/池外，方便诊断
+#   - 不一致警告：及时发现持久化问题
+#
 # 【v1.5更新】
 # - **修复跨境ETF延迟开盘问题**：
-#   - 发现513100.SS（纳指100）等跨境ETF在9:30不可交易，10:30才开盘
+#   - 发现513100.SS（纳指100）等跨境ETF在10:30开盘（非9:30）
 #   - 新增跨境ETF列表：g.cross_border_etfs，明确哪些ETF延迟开盘
 #   - 智能判断失败原因：区分"未开盘"和"停牌/数据异常"
 #     * 跨境ETF + 时间<10:30 + 价格失败 → 未开盘 → 触发10:30二次尝试
@@ -79,8 +109,8 @@
 #
 # ==================== 文件信息 ====================
 #
-# 版本：v1.5（跨境ETF延迟开盘修复）
-# 更新日期：2026-06-01
+# 版本：v1.5.2（跨境ETF卖出bug修复）
+# 更新日期：2026-06-02
 # 路径：D:\linux\ai_quant\ai_quant\quant_project\PtradeEgs\ETF_Core_Asset_Rotation_Strategy.py
 #
 # ==============================
@@ -577,10 +607,10 @@ def initialize(context):
 
     # ===== 8. 策略参数 =====
     g.m_days = 25  # 动量参考天数
-    g.capital_ratio = 0.2  # 策略可用资金比例（20%，双策略验证）
+    g.capital_ratio = 0.5  # 策略可用资金比例（20%，双策略验证）
 
     log.info("=" * 60)
-    log.info("【策略初始化】v1.5（跨境ETF延迟开盘修复）")
+    log.info("【策略初始化】v1.5.2（跨境ETF卖出bug修复）")
     log.info("-" * 60)
     log.info("    ETF池: %s" % ','.join(g.etf_pool))
     log.info("    动量天数: %d" % g.m_days)
@@ -588,6 +618,7 @@ def initialize(context):
     log.info("    安全区: score > 0 且 <= 5")
     log.info("    资金比例: %.0f%%" % (g.capital_ratio * 100))
     log.info("    特殊处理: 跨境ETF（513100等）10:30开盘，自动二次尝试")
+    log.info("    新增保障: 盘中成交确认 + 盘后强制同步（三重保障）")
     log.info("=" * 60)
 
     # ===== 9. 调仓控制 =====
@@ -598,6 +629,11 @@ def initialize(context):
     g.buy_order_value = 0     # 买入下单金额（等待确认）
     g.buy_order_price = 0     # 买入下单价格
     g.buy_order_failed = False  # 买入是否失败（停牌等）
+
+    # ===== 卖出订单状态变量 =====
+    g.sell_orders = []        # 卖出订单列表（等待确认）
+                             # 格式：[{'etf': code, 'shares': n}, ...]
+    g.sell_order_failed = False  # 卖出是否失败（跨境ETF未开盘等）
 
     # ===== 10. 回测设置 =====
     if not is_trade():
@@ -628,6 +664,10 @@ def before_trading_start(context, data):
     g.buy_order_value = 0     # 买入下单金额（等待确认）
     g.buy_order_price = 0     # 买入下单价格
     g.buy_order_failed = False  # 买入是否失败
+
+    # ========== 卖出订单状态初始化 ==========
+    g.sell_orders = []        # 卖出订单列表（等待确认）
+    g.sell_order_failed = False  # 卖出是否失败
 
     # 盘前同步持仓
     _sync_owned_positions(context)
@@ -693,18 +733,24 @@ def handle_data(context, data):
 
     # 10:30二次尝试机制（跨境ETF延迟开盘，4次重试）
     elif '10:30' <= current_time <= '10:35' and g.trade_done_today and g.second_round_retry_count < 4:
-        # 检查是否有买入失败的订单
+        # 检查是否有买入或卖出失败的订单
         buy_order_failed = getattr(g, 'buy_order_failed', False)
         buy_order_value = getattr(g, 'buy_order_value', 0)
+        sell_order_failed = getattr(g, 'sell_order_failed', False)
+        sell_orders = getattr(g, 'sell_orders', [])
 
-        if buy_order_failed or buy_order_value > 0:
-            # 有失败订单，尝试二次买入
+        if buy_order_failed or buy_order_value > 0 or sell_order_failed or sell_orders:
+            # 有失败订单，尝试二次买入/卖出
             last_retry_time = getattr(g, 'last_retry_time', '')
             if current_time != last_retry_time:
                 g.last_retry_time = current_time
                 log.info("=" * 60)
                 log.info("[10:30二次尝试] 时间: %s | 第%d次检查失败订单"
                          % (current_time, g.second_round_retry_count + 1))
+                log.info("    买入失败: %s | 买入待确认: %s"
+                         % (buy_order_failed, buy_order_value > 0))
+                log.info("    卖出失败: %s | 卖出待确认: %d只"
+                         % (sell_order_failed, len(sell_orders)))
                 log.info("=" * 60)
 
                 need_retry = check_and_retry(context, data)
@@ -713,44 +759,144 @@ def handle_data(context, data):
                     log.info("[10:30重试] 第%d次重试完成 @ %s"
                              % (g.second_round_retry_count, current_time))
 
+    # ========== 盘中成交确认机制（v1.5.1新增）==========
+    # 解决：用户在非重试时间窗口买入后，成交确认遗漏的问题
+    # 如果有下单记录（buy_order_value>0）且在交易时间，每分钟检查成交情况
+    elif g.trade_done_today and '09:30' <= current_time <= '15:00':
+        buy_order_value = getattr(g, 'buy_order_value', 0)
+        if buy_order_value > 0 and current_time not in ['09:31', '09:32', '09:33', '09:34', '09:35', '10:30', '10:31', '10:32', '10:33', '10:34', '10:35']:
+            # 有下单记录，但不在专门的重试时间窗口，检查成交
+            last_retry_time = getattr(g, 'last_retry_time', '')
+            if current_time != last_retry_time:
+                g.last_retry_time = current_time
+                # 调用成交确认检查
+                check_and_retry(context, data)
+
 
 def check_and_retry(context, data):
     """检查调仓是否完成，未完成则重试"""
     need_retry = False
 
-    # ========== 1. 检查卖出是否完成 ==========
-    hold_list = [etf for etf in g.owned_positions if _get_owned_amount(etf, context) > 0]
-
-    # 应该清仓但还持有的ETF（不在目标池）
-    sell_pending = []
-    for etf in hold_list:
-        if etf != g.target_etf:
-            owned_enable = _get_owned_enable_amount(etf, context)
-            if owned_enable > 0:
-                sell_pending.append(etf)
-                need_retry = True
-
-    if sell_pending:
+    # ========== 1. 检查卖出成交确认（v1.5.2新增）==========
+    sell_orders = getattr(g, 'sell_orders', [])
+    if sell_orders:
         log.info("-" * 60)
-        log.info("[重试检查] 发现待卖出ETF: %s" % ','.join(sell_pending))
-        for etf in sell_pending:
-            owned_enable = _get_owned_enable_amount(etf, context)
-            if owned_enable > 0:
-                # 拆单卖出
-                remaining = owned_enable
-                while remaining > 0:
-                    batch = min(remaining, 900000)
-                    batch = int(batch / 100) * 100
-                    if batch > 0:
-                        order(etf, -batch)
-                        remaining -= batch
-                    else:
-                        if remaining > 0:
-                            order(etf, -remaining)
-                        break
-                log.info("[重试] [%s] 卖出%d股" % (etf, owned_enable))
+        log.info("[卖出成交检查] 待确认卖出订单: %d只" % len(sell_orders))
+
+        sell_confirmed = []  # 已成交的卖出订单
+        for order in sell_orders[:]:  # 遍历副本
+            etf = order['etf']
+            shares = order['shares']
+
+            # 检查实际持仓是否已清空
+            real_pos = context.portfolio.positions.get(etf)
+            actual_shares = real_pos.amount if real_pos else 0
+
+            if actual_shares == 0:
+                # 已成交清仓，删除owned_positions
+                sell_confirmed.append(etf)
                 if etf in g.owned_positions:
                     del g.owned_positions[etf]
+                log.info("[卖出成交确认] [%s] 清仓成功，实际持仓=0" % etf)
+            else:
+                log.info("[卖出成交检查] [%s] 未成交，实际持仓=%d股" % (etf, actual_shares))
+
+        # 移除已成交的订单
+        for etf in sell_confirmed:
+            g.sell_orders = [o for o in g.sell_orders if o['etf'] != etf]
+
+        if sell_confirmed:
+            log.info("[卖出成交确认] 成交%d只，剩余待确认%d只"
+                     % (len(sell_confirmed), len(g.sell_orders)))
+
+        # 清除卖出失败标志（所有卖出订单已确认成交）
+        if not g.sell_orders:
+            g.sell_order_failed = False
+            log.info("[卖出成交确认] 所有卖出订单已成交，清除失败标志")
+
+    # ========== 2. 卖出重试（v1.5.2新增）==========
+    if g.sell_orders:
+        need_retry = True
+        log.info("-" * 60)
+        log.info("[卖出重试检查] 待重试卖出: %d只" % len(g.sell_orders))
+
+        for order in g.sell_orders[:]:  # 遍历副本
+            etf = order['etf']
+            expected_shares = order['shares']
+
+            # 检查实际持仓
+            real_pos = context.portfolio.positions.get(etf)
+            actual_shares = real_pos.amount if real_pos else 0
+
+            if actual_shares == 0:
+                # 已成交清仓
+                if etf in g.owned_positions:
+                    del g.owned_positions[etf]
+                g.sell_orders = [o for o in g.sell_orders if o['etf'] != etf]
+                log.info("[卖出重试] [%s] 已清仓，移除订单" % etf)
+                continue
+
+            # 检查可卖数量
+            owned_enable = _get_owned_enable_amount(etf, context)
+            if owned_enable == 0:
+                # 可卖数量为0（T+1锁定或已清仓）
+                log.warning("[卖出重试] [%s] 可卖数量=0，跳过" % etf)
+                continue
+
+            # ===== 跨境ETF判断 =====
+            try:
+                price = data[etf].price if hasattr(data[etf], 'price') else 0
+            except:
+                price = 0
+
+            current_time = context.blotter.current_dt.strftime('%H:%M')
+            is_cross_border = etf in g.cross_border_etfs
+
+            if price <= 0:
+                if is_cross_border and current_time < '10:30':
+                    # 跨境ETF未开盘，等待10:30
+                    log.warning("[卖出重试] [%s] 跨境ETF未开盘，等待10:30二次尝试" % etf)
+                    g.sell_order_failed = True
+                    continue
+                else:
+                    # 停牌或数据异常
+                    log.warning("[卖出重试] [%s] 无法获取价格（停牌或数据异常）" % etf)
+                    continue
+
+            # 重新下单卖出
+            remaining = owned_enable
+            while remaining > 0:
+                batch = min(remaining, 900000)
+                batch = int(batch / 100) * 100
+                if batch > 0:
+                    order(etf, -batch)
+                    remaining -= batch
+                else:
+                    if remaining > 0:
+                        order(etf, -remaining)
+                    break
+
+            log.info("[卖出重试] [%s] 重新卖出%d股" % (etf, owned_enable))
+
+    # ========== 3. 检查卖出是否完成（原有逻辑改造）==========
+    # 补充检查：如果hold_list中有不在目标池且不在sell_orders中的ETF
+    # 说明是trade()遗漏的，需要补充卖出
+    hold_list = [etf for etf in g.owned_positions if _get_owned_amount(etf, context) > 0]
+
+    for etf in hold_list:
+        if etf != g.target_etf:
+            # 检查是否已在sell_orders中
+            in_sell_orders = any(o['etf'] == etf for o in g.sell_orders)
+            if not in_sell_orders:
+                owned_enable = _get_owned_enable_amount(etf, context)
+                if owned_enable > 0:
+                    # 补充记录卖出订单
+                    g.sell_orders.append({
+                        'etf': etf,
+                        'shares': owned_enable
+                    })
+                    need_retry = True
+                    log.warning("[卖出检查] [%s] 发现遗漏的卖出订单，已补充记录" % etf)
 
     # ========== 2. 检查买入是否完成 ==========
     if g.target_etf:
@@ -930,6 +1076,45 @@ def trade(context, data):
             # 不在目标池，卖出
             owned_enable = _get_owned_enable_amount(etf, context)
             if owned_enable > 0:
+                # ===== 跨境ETF判断：未开盘则跳过 =====
+                try:
+                    price = data[etf].price if hasattr(data[etf], 'price') else 0
+                except:
+                    price = 0
+
+                current_time = context.blotter.current_dt.strftime('%H:%M')
+                is_cross_border = etf in g.cross_border_etfs
+
+                if price <= 0 and is_cross_border and current_time < '10:30':
+                    # 跨境ETF未开盘（10:30才开盘）
+                    log.warning("    [%s] 无法获取价格（跨境ETF未开盘，等待10:30二次尝试）" % etf)
+                    g.sell_order_failed = True  # 触发10:30二次尝试
+
+                    # 记录卖出订单（等待成交确认）
+                    g.sell_orders.append({
+                        'etf': etf,
+                        'shares': owned_enable
+                    })
+                    sell_count += 1
+                    total_sell_shares += owned_enable
+
+                    # 注意：不立即删除owned_positions，等待成交确认
+                    log.info("    [%s] 卖出订单已记录，等待10:30二次尝试" % etf)
+                    continue
+                elif price <= 0:
+                    # 普通ETF或10:30之后仍无法获取价格 → 停牌/数据异常
+                    log.warning("    [%s] 无法获取价格（停牌或数据异常）" % etf)
+                    # 仍记录卖出订单，等待重试
+                    g.sell_orders.append({
+                        'etf': etf,
+                        'shares': owned_enable
+                    })
+                    sell_count += 1
+                    total_sell_shares += owned_enable
+                    log.info("    [%s] 卖出订单已记录，等待9:31-35重试" % etf)
+                    continue
+
+                # ===== 正常卖出（价格正常）=====
                 # 拆单卖出（单笔最大90万股）
                 remaining = owned_enable
                 while remaining > 0:
@@ -946,17 +1131,19 @@ def trade(context, data):
                 sell_count += 1
                 total_sell_shares += owned_enable
 
-                try:
-                    price = data[etf].price if hasattr(data[etf], 'price') else 0
-                    sell_value = owned_enable * price
-                    log.info("    [%s] 卖出 → 清仓%d股，市值%.2f元"
-                             % (etf, owned_enable, sell_value))
-                except:
-                    log.info("    [%s] 卖出 → 清仓%d股" % (etf, owned_enable))
+                sell_value = owned_enable * price
+                log.info("    [%s] 卖出 → 清仓%d股，市值%.2f元"
+                         % (etf, owned_enable, sell_value))
 
-                # 更新owned_positions
-                if etf in g.owned_positions:
-                    del g.owned_positions[etf]
+                # 记录卖出订单（等待成交确认）
+                g.sell_orders.append({
+                    'etf': etf,
+                    'shares': owned_enable
+                })
+
+                # 注意：不立即删除owned_positions，等待成交确认
+                # 成交确认在check_and_retry()中处理
+                log.info("    [%s] 卖出订单已记录，等待成交确认" % etf)
         else:
             log.info("    [%s] 继续持有（与目标一致）" % etf)
 
@@ -1045,6 +1232,80 @@ def trade(context, data):
 # ============ 盘后处理 ============
 def after_trading_end(context, data):
     """盘后同步+持久化"""
+
+    # ========== 盘后强制同步持仓（v1.5.1新增）==========
+    # 解决：盘中买入成交确认遗漏的问题
+    # 如果有下单记录但未确认成交，强制从账户同步持仓
+    buy_order_value = getattr(g, 'buy_order_value', 0)
+    if buy_order_value > 0 and g.target_etf:
+        # 有下单记录，检查账户真实持仓
+        real_pos = context.portfolio.positions.get(g.target_etf)
+        actual_shares = real_pos.amount if real_pos else 0
+
+        if actual_shares > 0:
+            # 有实际持仓，强制更新owned_positions
+            g.owned_positions[g.target_etf] = actual_shares
+            log.info("[盘后强制同步] [%s] 发现实际持仓%d股，强制更新owned_positions"
+                     % (g.target_etf, actual_shares))
+            # 清除下单记录
+            g.buy_order_value = 0
+            g.buy_order_price = 0
+            g.buy_order_failed = False
+        else:
+            log.warning("[盘后强制同步] [%s] 下单%.2f元但实际持仓为0，可能订单失败"
+                        % (g.target_etf, buy_order_value))
+
+    # ========== 盘后强制同步卖出持仓（v1.5.2新增）==========
+    sell_orders = getattr(g, 'sell_orders', [])
+    if sell_orders:
+        log.info("-" * 60)
+        log.info("[盘后卖出同步] 发现%d只待确认卖出订单" % len(sell_orders))
+
+        sell_confirmed = []  # 已成交的卖出订单
+        for order in sell_orders[:]:  # 遍历副本
+            etf = order['etf']
+            expected_shares = order['shares']
+
+            # 检查实际持仓
+            real_pos = context.portfolio.positions.get(etf)
+            actual_shares = real_pos.amount if real_pos else 0
+
+            if actual_shares == 0:
+                # 已成交清仓
+                sell_confirmed.append(etf)
+                if etf in g.owned_positions:
+                    del g.owned_positions[etf]
+                log.info("[盘后卖出同步] [%s] 已清仓，删除owned_positions" % etf)
+            else:
+                # 未成交或部分成交
+                log.warning("[盘后卖出同步] [%s] 未清仓，实际持仓=%d股（预期清仓%d股）"
+                            % (etf, actual_shares, expected_shares))
+
+                # 强制同步owned_positions为实际持仓
+                if actual_shares > 0:
+                    g.owned_positions[etf] = actual_shares
+                    log.info("[盘后卖出同步] [%s] 强制更新owned_positions=%d股"
+                             % (etf, actual_shares))
+                else:
+                    # 实际持仓为0，删除owned_positions
+                    if etf in g.owned_positions:
+                        del g.owned_positions[etf]
+                    log.info("[盘后卖出同步] [%s] 实际持仓为0，删除owned_positions" % etf)
+
+                sell_confirmed.append(etf)  # 标记为已处理
+
+        # 清空卖出订单列表
+        for etf in sell_confirmed:
+            g.sell_orders = [o for o in g.sell_orders if o['etf'] != etf]
+
+        log.info("[盘后卖出同步] 处理完成，剩余待确认订单: %d只" % len(g.sell_orders))
+
+        # 强制清空卖出订单列表（盘后强制清空）
+        if g.sell_orders:
+            log.warning("[盘后卖出同步] 强制清空未确认订单: %d只" % len(g.sell_orders))
+            g.sell_orders = []
+
+    # 盘前同步持仓
     _sync_owned_positions(context)
 
     # 仅实盘保存状态
@@ -1086,5 +1347,33 @@ def after_trading_end(context, data):
 
     if not owned_list:
         log.info("    (空仓)")
+
+    # ========== 账户真实持仓显示（v1.5.1新增）==========
+    # 解决：owned_positions可能遗漏的问题，显示账户真实持仓作为对照
+    log.info("-" * 60)
+    log.info(">>> 账户真实持仓对照:")
+    account_positions = []
+    for code, pos in context.portfolio.positions.items():
+        amount = getattr(pos, 'amount', 0)
+        if amount > 0:
+            account_positions.append(code)
+            try:
+                price = data[code].price if hasattr(data[code], 'price') else 0
+                value = amount * price if amount > 0 else 0
+                # 检查是否在ETF池内
+                in_pool = code in g.etf_pool
+                pool_mark = "✓池内" if in_pool else "✗池外"
+                log.info("    [%s] %d股 | 市值=%.2f元 | %s"
+                         % (code, amount, value, pool_mark))
+            except:
+                log.info("    [%s] %d股" % (code, amount))
+
+    if not account_positions:
+        log.info("    (空仓)")
+
+    # 如果账户持仓与策略持仓不一致，警告
+    if len(account_positions) != len(owned_list):
+        log.warning("[持仓对照] 账户有%d只，策略追踪%d只，不一致！请检查持久化"
+                    % (len(account_positions), len(owned_list)))
 
     log.info("=" * 60)

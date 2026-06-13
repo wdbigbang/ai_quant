@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "strategy_name": "etf_core_asset_rotation",
+  "pool_config": {
+    "type": "static",
+    "value": [
+      "518880.SS",
+      "513100.SS",
+      "159915.SZ",
+      "510180.SS"
+    ]
+  },
+  "saved_date": "2026-06-01",
+  "strategy_uuid": "e6e713c4",
+  "owned_positions": {
+    "513100.SS": 22400
+  },
+  "last_trade_date": "2026-06-01"
+}
